@@ -1,0 +1,37 @@
+{
+  "classes": [
+    "a photo of nature",
+    "a photo of cat",
+    "a photo of a party",
+    "a photo of a food",
+    "a photo of transport",
+    "a photo of book",
+    "a photo of window",
+    "a photo of sports",
+    "a photo of art",
+    "a photo of travel",
+    "a photo of person",
+    "a photo of headphones",
+    "a photo of architecture",
+    "a photo of a concert"
+  ],
+  "db_dict": {
+    "a photo of nature": "nature",
+    "a photo of cat": "cats",
+    "a photo of a party": "party",
+    "a photo of a food": "food",
+    "a photo of transport": "transport",
+    "a photo of book": "books",
+    "a photo of window": "windows",
+    "a photo of sports": "sports",
+    "a photo of art": "art",
+    "a photo of travel": "travel",
+    "a photo of person": "person",
+    "a photo of headphones": "headphones",
+    "a photo of architecture": "architecture",
+    "a photo of a concert": "concert"
+  },
+  "th_others": 0.5,
+  "imgs_path": "/home/jovyan/dlba/dlba_course_miba_25/topic_09/app/data/",
+  "docs_db_path": "/home/jovyan/dlba/dlba_course_miba_25/topic_18/app/data/rag"
+}

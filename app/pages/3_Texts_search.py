@@ -1,0 +1,713 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+import os
+import io
+import json
+import datetime
+import streamlit as st
+import urllib.request
+from pathlib import Path
+
+from langchain_chroma import Chroma
+from langchain_community.embeddings.yandex import YandexGPTEmbeddings
+from langchain_community.chat_models import ChatYandexGPT
+from langchain_community.llms import YandexGPT
+from langchain_community.vectorstores import FAISS
+from langchain_core.documents import Document
+from langchain_core.prompts import PromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
+from econs_parsing import parse_all_articles
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+
+import os
+import random
+import requests
+import json
+import glob
+import re
+from typing import List
+
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
+
+########## Funtions block
+def read_json(file_path):
+    with open(file_path) as file:
+        access_data = json.load(file)
+    return access_data
+
+
+def create_documents(papers: List):
+    documents = []
+    for paper in papers:
+        structured_text = f"""
+        ECONOMIC RESEARCH PAPER
+        TITLE: {paper['title']}
+        ABSTRACT: {paper['full_abstract']}
+        """
+        paper['structured_text'] = structured_text
+        content = paper.get('structured_text')
+        metadata = paper.copy()
+        metadata.pop('full_abstract')
+        if 'abstract' in paper.keys():
+            metadata.pop('abstract')
+        metadata.pop('structured_text')
+        doc = Document(
+            page_content = content,
+            metadata = metadata
+        )
+        documents.append(doc)
+    return documents
+
+@st.cache_resource
+def upload_database(db_path):
+    json_files = glob.glob(os.path.join(db_path, "*.json"))
+    if not json_files:
+        raise FileNotFoundError(f"No JSON files found in {db_path}")
+    json_file = json_files[0]
+    with open(json_file, 'r', encoding='utf-8') as file:
+        data = json.load(file)
+    return data
+
+@st.cache_resource
+def initialize_faiss_vectorstore(state = 'abstract'):
+    DB_PATH = st.session_state.db_path
+    embedder  = YandexGPTEmbeddings(
+        api_key = st.session_state.api_creds['api_key'],
+        folder_id = st.session_state.api_creds['folder_id'],
+        sleep_interval = .1
+    )
+    if state == "abstract":
+        FAISS_INDEX_PATH = "./faiss_index_abstract"
+        if os.path.exists(FAISS_INDEX_PATH):
+           with st.spinner('Loading FAISS index...'):
+                vectorestore = FAISS.load_local(
+                    FAISS_INDEX_PATH, 
+                    embedder, 
+                    allow_dangerous_deserialization=True
+                )
+                st.success("FAISS index has been successfully loaded")
+                return vectorestore
+        else:
+            if state == 'abstract':
+                papers = st.session_state.papers
+                documents = create_documents(papers)
+                with st.spinner('Creating embeddings'):
+                    vectorestore = FAISS.from_documents(
+                        documents = documents,
+                        embedding = embedder
+                        )
+                    vectorestore.save_local('faiss_index_abstract')
+                    st.success("FAISS index created and saved")
+                    return vectorestore
+
+def get_rag_chain(template, temperature, api_creds, vectorestore = None,  k_max = None):
+    """
+    RAG initialization with input parameters.
+    
+    Args:
+      :vectorstore:
+      :templae:
+      :temperature:
+      :k_max:
+      :api_creds:
+
+    Returns:
+      RAG chain instance
+    
+    """
+    system_prompt = PromptTemplate.from_template(template) 
+    llm = YandexGPT(
+        name="yandexgpt",
+        api_key=api_creds['api_key'], 
+        folder_id=api_creds['folder_id'],
+        temperature = temperature
+    )
+        
+    if vectorestore:
+        retriever = vectorestore.as_retriever(
+            search_type = 'similarity',
+            search_kwargs={"k": k_max}
+        )
+        rag_chain =  (
+            {"context": retriever, "question": RunnablePassthrough()}
+            | system_prompt
+            | llm
+            | StrOutputParser()
+        )
+
+    else:
+        rag_chain =  (
+            {"question": RunnablePassthrough()}
+            | system_prompt
+            | llm
+            | StrOutputParser()
+        )
+    
+    return rag_chain
+    
+def save_pdf(text, title):
+    buffer = io.BytesIO()
+
+    margins = {
+        'leftMargin': 1*inch,
+        'rightMargin': 1*inch,
+        'topMargin': 1*inch,
+        'bottomMargin': 1*inch
+    }
+    doc = SimpleDocTemplate(
+        buffer, 
+        pagesize=letter,
+        **margins,
+        title=title,
+        author="Generated by Streamlit App",
+        subject="Document",
+        creator="Streamlit PDF Generator"
+    )
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        'CustomTitle',
+        parent=styles['Heading1'],
+        fontSize=18,
+        alignment=TA_CENTER,
+        spaceAfter=24,
+        fontName='Helvetica-Bold'
+    )
+    text_style = ParagraphStyle(
+        'CustomText',
+        parent=styles['Normal'],
+        fontSize=12,
+        alignment=TA_JUSTIFY,  
+        leading=14.5, 
+        wordWrap='LTR',  # Перенос слов
+        fontName='Helvetica'
+    )
+    story = []
+    story.append(Paragraph(title, title_style))
+    story.append(Spacer(1, 0.25*inch))
+    paragraphs = text.split('\n')
+    for para in paragraphs:
+        if para.strip():  # Пропускаем пустые строки
+            story.append(Paragraph(para, text_style))
+            story.append(Spacer(1, 0.12*inch))
+    doc.build(story)
+    
+    buffer.seek(0)
+
+    return buffer
+
+def download_full_articles(titles: List, papers: List, dir_path : str):
+    for title in titles:
+        for paper in papers:
+            if title.lower() in paper.get('title').lower():
+                download_path = os.path.join(dir_path, title)
+                if 'pdf_url' in paper.keys():
+                    response = requests.get(paper.get('pdf_url'))
+                    response.raise_for_status()
+                    
+                else:
+                    article_id = paper.get('id')
+                    url = f"https://papers.ssrn.com/sol3/Delivery.cfm/SSRN_ID{article_id}_code459177.pdf"
+                    params = {
+                        'abstractid': article_id,
+                        'mirid': '1',
+                        'type': '2'
+                    }
+                    
+                    headers = {
+                        'User-Agent': 'Mozilla/5.0',
+                        'Referer': f'https://papers.ssrn.com/sol3/papers.cfm?abstract_id={article_id}',
+                        'Accept': 'application/pdf,*/*'
+                    }
+                    
+                    response = requests.get(url, params=params, headers=headers, stream=True)
+                    response.raise_for_status()
+                # if response.status_code == 200:
+                with open(f'{download_path}.pdf', 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+
+############################################################ End of fucntions block     
+
+if "api_creds" not in st.session_state:
+    st.session_state.api_creds = read_json('apicreds.json')
+if "db_path" not in st.session_state:
+    st.session_state.db_path = read_json('config.json')['docs_db_path']
+
+
+llm  = YandexGPT(
+        name="yandexgpt",
+        api_key = st.session_state.api_creds['api_key'], 
+        folder_id =st.session_state.api_creds['folder_id']
+    )
+
+st.set_page_config(
+    page_title="AI search with chat",
+    page_icon="💬"
+)
+st.sidebar.header('Chat-bot with LLM')
+st.header('AI assitant for RAG-based economic litrature search and review', divider='rainbow')
+
+st.markdown("""
+    **🤖 What this chatbot does:**
+    - 🔍 Finds relevant economic research based on your query
+    - 📊 Analyzes academic articles using RAG (Retrieval-Augmented Generation)
+    - 📈 Assists in writing literature reviews
+    - 💡 Suggests new research directions
+""")
+
+st.divider()
+
+########## Articles parsing
+if "papers" not in st.session_state:
+    st.session_state.papers = None
+st.markdown(
+    """
+    To begin, enter your research keywords or extract them automatically using YandexGPT.
+    """
+)
+col1, col2 = st.columns([2,2])
+with col1:
+    db_button = st.button("I already have a database")    
+    if db_button:
+        st.session_state.mode = "use_existing"
+        papers = upload_database(st.session_state.db_path)
+        st.session_state.papers = papers
+        st.success(f"✅ Loaded {len(papers)} papers")
+        # st.rerun() 
+    
+with col2:
+    search_button = st.button('I need to create a database')
+if search_button:
+    st.session_state.mode = "create_new"
+if st.session_state.get('mode') == "create_new":
+    keywords = []
+    tab1, tab2 = st.tabs(["🔍 Manual Search", "🤖 AI-Assisted Search"])
+    with tab1:
+        input_text = st.text_input(
+        "Enter keywords to search for articles",
+        help="Separate keywords with commas"
+    )
+        if input_text:
+            keywords = [
+                word.strip() for word in input_text.split(',') if word.strip()
+            ]
+    with tab2:
+
+        system_prompt = """
+        You are an expert research librarian and metadata specialist.
+        
+        TASK: Extract main research topics from an article title.
+        
+        GUIDELINES:
+        1. Identify 3-4 key research topics/concepts
+        2. Focus on substantive content, not filler words
+        3. Include both broad fields and specific subtopics
+        4. Prioritize topics and keywords that would be effective for searching in economic literature databases
+        5. Return as a comma-separated list
+        
+        EXAMPLE:
+        Title: "Monetary Policy Transmission in Emerging Markets During the 2020-2023 Period"
+        Output: monetary policy, emerging markets, interest rate transmission, post-pandemic economy, central banking
+        
+        "Question: {question}\n"
+        "Answer: "
+        """
+        rag_topic = get_rag_chain(
+            template =  system_prompt, 
+            temperature = 0.6,
+            api_creds = st.session_state.api_creds
+        )
+        gpt_input = st.text_area(
+            "Enter your research topic or question:",
+            height=120,
+            placeholder="Example: Monetary Policy Transmission in Emerging Markets During the 2020-2023 Period",
+            help="Be as specific as possible for better keyword extraction"
+        )
+    
+        if gpt_input:
+            answer = rag_topic.invoke(gpt_input)
+            keywords = [word.strip() for word in answer.split(',')]
+            st.info("Keywords: " + ', '.join(keywords))
+    if gpt_input or input_text:
+        num_articles = st.slider(
+        "Number of articles to download:",
+        min_value=1,
+        max_value=450,
+        value=20, 
+        step=1,
+        help="Select how many articles you want to download"
+        )
+        if st.button("✅ Confirm Selection", type="primary"):
+            st.session_state.parameters_confirmed = True
+            st.session_state.keywords = keywords
+            st.session_state.num_articles = num_articles
+            
+        if st.session_state.get('parameters_confirmed'):
+            st.info(f"""
+                **✅ Search Parameters Confirmed**
+                
+                **Keywords:** {", ".join(keywords)}  
+                **Number of articles:** {num_articles}
+                """
+            )
+            
+
+            if st.button("Begin parsing", type="primary"):
+                with st.spinner("Parsing the articles. It may take up to 20 minutes"):
+                    papers = parse_all_articles(
+                        keywords = keywords, 
+                        max_articles = num_articles,
+                        saving_path = st.session_state.db_path,
+                        load_full_abstract = True, 
+                        save = True)
+                    st.success(f"""
+                    ✅ **Parsing Completed Successfully!**
+                    
+                    **Results:**
+                    - Articles parsed: **{len(papers)}**
+                    - Keywords used: **{len(keywords)}**
+                    - Saved to: `{st.session_state.db_path}`
+                    
+                    **Next steps:**
+                    1. Articles are saved and ready for search
+                    2. You can now use the search functionality
+                    3. Database has been updated
+                    """)
+                    st.session_state.papers = papers
+#####################################################################End of articles parsing
+#####################################################################Abstracts querieng
+if "papers" in st.session_state and st.session_state.papers is not None:
+    st.divider()
+    if "vectorestore_abstracts" not in st.session_state:
+        st.session_state.vectorestore_abstracts = initialize_faiss_vectorstore()
+    st.write('#### Temperature for bot')
+    st.write(
+        """
+        The higher the value of this parameter, the more creative
+        and random the model's responses will be. Accepts values
+        from 0 (inclusive) to 1 (inclusive).
+        Default value: 0 (no creativity)
+        """
+    )
+    temperature = st.slider("Input temperature for chat-bot", .0, 1., .0, .1)
+    
+    st.write('#### Enter the number of relevant articles')
+    st.write(
+        """
+        You need to specify the maximum number of articles in a single
+        search to limit the search scope for the chat-bot.
+        Default value: 10 articlces
+        """
+    )
+    k_max = st.slider('Enter the number of articles', 5, 80, 10)
+    
+    st.info(f"""
+    **You've selected:**
+    
+    - **Temperature:** {temperature}
+    - **Number of articles:** {k_max}
+    
+    You can now use the chat functionality with these settings.
+    """)
+    system_prompt =  (
+    "You are an expert research assistant."
+    "Your task is to answer questions based ONLY on the provided context from academic papers."
+    "Use the following pieces of context to answer the question at the end. "
+    "If you don't know the answer, just say that you don't know, don't try to make up an answer."
+    "Context: {context}\n"
+    "Question: {question}\n"
+    "Answer: "
+    )
+    
+    rag_chain = get_rag_chain(
+        vectorestore = st.session_state.vectorestore_abstracts, 
+        template = system_prompt, 
+        temperature = temperature, 
+        k_max = k_max, 
+        api_creds = st.session_state.api_creds)
+
+    st.write('#### Ask chat-bot your questions')
+    if 'messages' not in st.session_state:
+        st.session_state.messages = []
+    for message in st.session_state.messages:
+        with st.chat_message(message['role']):
+            st.markdown(message['content'])
+    if query := st.chat_input('Enter your message'):
+        st.chat_message('user').markdown(query)
+        st.session_state.messages.append(
+            {
+                'role': 'user',
+                'content': query
+            }
+        )
+        answer = rag_chain.invoke(query)
+        with st.chat_message('assistant'):
+            st.markdown(answer)
+        st.session_state.messages.append(
+            {
+                'role': 'assistant',
+                'content': answer
+            }
+        )
+        st.session_state.answer = answer
+    
+    if "answer" in st.session_state:
+        col1, col2, col3 = st.columns([2,2, 2])
+        
+        with col1:
+            generate_pdf = st.button("📥 Generate PDF")
+            if generate_pdf:
+                st.session_state.generate_pdf = not st.session_state.get("generate_pdf", False)
+        if st.session_state.get("generate_pdf"):
+            pdf_title = st.text_input("Type in the file name", key="pdf_title")
+        if st.session_state.get("pdf_title"):
+            st.session_state.pdf_data = save_pdf(st.session_state.answer, st.session_state.get("pdf_title"))
+        
+        if st.session_state.get("pdf_data") and st.session_state.get("pdf_title"):
+            st.download_button(
+                label="⬇️ Download PDF",
+                data=st.session_state.pdf_data,
+                file_name=f"{st.session_state.pdf_title}.pdf",
+                mime="application/pdf"
+            )
+                
+        with col2:
+            deep_study_clicked = st.button("🔬 Deep study", key="deep_study_button")
+    
+            if deep_study_clicked:
+                st.session_state.deep_study = not st.session_state.get("deep_study", False)
+        if st.session_state.get("deep_study"):    
+            st.write("#### Documents analysis")
+            st.markdown("""
+            In this secion can study the selected papers from the database in more detail. 
+            Enter titles of interesting papers in the field below   
+            Each paper will be available for:
+            - 📖 Full text analysis
+            - 🔍 Methodology extraction
+            - 📊 Results comparison
+            - 📝 Notes & annotations
+        
+            Pose specific questions about these papers to get AI-powered insights
+            """)
+            papers_input= st.text_area(
+            "**Enter paper titles (one per line or separated by commas):**",
+            placeholder="Example:\n'The Impact of US-China Tariffs on Global Value Chains'\n'Or separate with commas: \
+            Paper A, Paper B, Paper C'",
+            help="Copy and paste paper titles from your search results. You can add multiple papers at once.",
+            height = 100
+            )
+            if papers_input:
+                papers_to_load = re.split(r'[,\n]', papers_input)
+                papers_to_load = [paper.strip() for paper in papers_to_load if paper.strip()]
+                if st.button("Download full articles"):
+                    with st.spinner("Loading the papers ..."):
+                        download_full_articles(
+                            papers_to_load,
+                            st.session_state.papers, 
+                            "/home/jovyan/dlba/dlba_course_miba_25/topic_18/app/data/rag"
+                    )
+                    st.succes('All papers are in the "Articles database" tab')
+                # st.write(papers_to_load)
+            
+                
+        with col3:
+            download_conversation = st.button("💾 Download Conversation", key="download_conversation")
+    
+            if download_conversation:
+                st.session_state.full_conversation = not st.session_state.get("full_conversation", False)
+        if st.session_state.get("download_conversation"):
+            messages = []
+            for mes in st.session_state.messages:
+                messages.append(mes.get("content"))
+            conversation = save_pdf("\n".join(messages), title = "Full conversation")
+            st.success("Pdf generated")
+            st.download_button(
+                label="⬇️ Download Conversation",
+                data=conversation,
+                file_name=f"{"full_conversation"}.pdf",
+                mime="application/pdf"
+            )
+    
+                
+                
+
+# # @st.cache_resource
+# # def initialize_faiss_vectorstore():
+# #     """
+# #     Vectorstore database initialization.
+    
+# #     We use FAISS instead of Chroma in this application.
+    
+# #     """
+# #     API_CREDS = read_json(file_path='apicreds.json')
+# #     APP_CONFIG = read_json(file_path='config.json')
+# #     DATA_PATH = f"{APP_CONFIG['imgs_path']}/rag"
+# #     FAISS_INDEX_PATH = "./faiss_index"
+
+# #     ####################################
+# #     ########## YOUR CODE HERE ##########
+# #     ####################################
+# #     # You have to create embeddings 
+# #     # for vectorstore below
+    
+# #     embedder = YandexGPTEmbeddings(
+# #             api_key = api_creds['api_key'],
+# #             folder_id = api_creds['folder_id'],
+# #             sleep_interval = .1
+# #         )
+
+# #     # HINT: use code from chapter 7.3 
+# #     # of the RAG notebook 
+    
+# #     ####################################
+    
+# #     # If index exists...
+# #     if os.path.exists(FAISS_INDEX_PATH):
+# #         with st.spinner('Loading FAISS index...'):
+# #             vectorstore = FAISS.load_local(
+# #                 FAISS_INDEX_PATH, 
+# #                 embeddings, 
+# #                 allow_dangerous_deserialization=True
+# #             )
+# #             st.success("FAISS index loaded")
+# #             return vectorstore, API_CREDS
+    
+# #     # ...or create new index
+# #     with st.spinner('Documents are loading...'):
+# #         ####################################
+# #         ########## YOUR CODE HERE ##########
+# #         ####################################
+# #         # You have to create loader and docs
+# #         # objects to load documents
+
+# #         loader = # YOUR CODE HERE
+# #         docs = # YOUR CODE HERE
+        
+# #         # HINT: use code from chapter 7.2 
+# #         # of the RAG notebook 
+        
+# #         ####################################
+    
+# #     with st.spinner('Processing documents...'):
+# #         ####################################
+# #         ########## YOUR CODE HERE ##########
+# #         ####################################
+# #         # You have to create text splitter 
+# #         # and get splits
+
+# #         text_splitter = # YOUR CODE HERE
+# #         splits = # YOUR CODE HERE
+        
+# #         # HINT: use code from chapter 7.2 
+# #         # of the RAG notebook 
+        
+# #         ####################################
+    
+# #     with st.spinner('Creating FAISS index...'):
+# #         vectorstore = FAISS.from_documents(splits, embeddings)
+# #         vectorstore.save_local(FAISS_INDEX_PATH)
+# #         st.success("FAISS index created and saved")
+    
+# #     return vectorstore, API_CREDS
+
+
+
+# # We init vectorstore here and put in to app state
+# # for single load when application starts / restarts
+# if 'vectorstore' not in st.session_state:
+#     st.session_state.vectorstore, st.session_state.api_creds = initialize_faiss_vectorstore()
+
+# # Chat prompt
+# # You may experiment with it, 
+# # but keep "Context: {context}\n" and "Question: {question}\n"
+# default_instruction = (
+#     "Use the following pieces of context to answer the question at the end. "
+#     "If you don't know the answer, just say that you don't know, don't try to make up an answer. "
+#     "Use three sentences maximum and keep the answer as concise as possible. "
+#     "Always say \"thanks for asking!\" at the end of the answer. \n"
+#     "Context: {context}\n"
+#     "Question: {question}\n"
+#     "Answer: "
+# )
+
+# st.write('#### Give a prompt')
+# template = st.text_area(
+#     'Input prompt for chat-bot',
+#     default_instruction
+# )
+
+# st.write('#### Temperature for bot')
+# st.write(
+#     """
+#     The higher the value of this parameter, the more creative
+#     and random the model's responses will be. Accepts values
+#     from 0 (inclusive) to 1 (inclusive).
+#     Default value: 0 (no creativity)
+#     """
+# )
+# temperature = st.slider("Input temperature for chat-bot", .0, 1., .0, .1)
+
+# st.write('#### Enter the number of relevant documents')
+# st.write(
+#     """
+#     You need to specify the maximum number of documents in a single
+#     search to limit the search scope for the chat-bot.
+#     Default value: 3 documents
+#     """
+# )
+# k_max = st.slider('Enter the number of documents', 1, 5, 3)
+
+# # Create RAG with parameters (temperature, k_max, ...)
+# ####################################
+# ########## YOUR CODE HERE ##########
+# ####################################
+# # You have to create embeddings 
+# # for vectorstore below
+
+# rag_chain = # YOUR CODE HERE
+
+# # HINT: use function `get_rag_chain(...)`
+# # from above and pass all parameters like
+# #   st.session_state.vectorstore, 
+# #   template, 
+# #   temperature, 
+# #   k_max, 
+# #   st.session_state.api_creds
+# # to that function
+
+# ####################################
+
+# # Start chat
+# st.write('#### Ask chat-bot your questions')
+
+# if 'messages' not in st.session_state:
+#     st.session_state.messages = []
+
+# for message in st.session_state.messages:
+#     with st.chat_message(message['role']):
+#         st.markdown(message['content'])
+
+# if query := st.chat_input('Enter your message'):
+#     st.chat_message('user').markdown(query)
+#     st.session_state.messages.append(
+#         {
+#             'role': 'user',
+#             'content': query
+#         }
+#     )
+    
+#     answer = rag_chain.invoke(query)
+#     with st.chat_message('assistant'):
+#         st.markdown(answer)
+#     st.session_state.messages.append(
+#         {
+#             'role': 'assistant',
+#             'content': answer
+#         }
+#     )

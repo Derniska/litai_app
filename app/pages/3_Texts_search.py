@@ -9,7 +9,6 @@ import streamlit as st
 import urllib.request
 from pathlib import Path
 
-from langchain_chroma import Chroma
 from langchain_community.embeddings.yandex import YandexGPTEmbeddings
 from langchain_community.chat_models import ChatYandexGPT
 from langchain_community.llms import YandexGPT
@@ -18,9 +17,10 @@ from langchain_core.documents import Document
 from langchain_core.prompts import PromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
+from langchain_community.document_loaders import DirectoryLoader, PyMuPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
 from econs_parsing import parse_all_articles
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.units import inch
 
 import os
 import random
@@ -34,6 +34,8 @@ from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
 
 ########## Funtions block
 def read_json(file_path):
@@ -77,34 +79,53 @@ def upload_database(db_path):
 @st.cache_resource
 def initialize_faiss_vectorstore(state = 'abstract'):
     DB_PATH = st.session_state.db_path
+
+    text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=1000,  
+                chunk_overlap=200  
+            )
+    
     embedder  = YandexGPTEmbeddings(
         api_key = st.session_state.api_creds['api_key'],
         folder_id = st.session_state.api_creds['folder_id'],
         sleep_interval = .1
     )
-    if state == "abstract":
-        FAISS_INDEX_PATH = "./faiss_index_abstract"
-        if os.path.exists(FAISS_INDEX_PATH):
-           with st.spinner('Loading FAISS index...'):
-                vectorestore = FAISS.load_local(
-                    FAISS_INDEX_PATH, 
-                    embedder, 
-                    allow_dangerous_deserialization=True
+    FAISS_INDEX_PATH = "./faiss_index_abstract" if state == "abstract" else "./faiss_index_full"
+    if os.path.exists(FAISS_INDEX_PATH):
+       with st.spinner('Loading FAISS index...'):
+            vectorestore = FAISS.load_local(
+                FAISS_INDEX_PATH, 
+                embedder, 
+                allow_dangerous_deserialization=True
+            )
+            st.success("FAISS index has been successfully loaded")
+            return vectorestore
+    elif state == "abstract":
+        papers = st.session_state.papers
+        documents = create_documents(papers)
+        
+    else:
+        loader = DirectoryLoader(
+            DOCS_PATH, 
+            glob="**/*.pdf", 
+            loader_cls=PyMuPDFLoader,
+            show_progress=True, 
+            use_multithreading=True
+        )
+        articles = loader.load()
+        documents = f
+        st.info(f"Loaded {len(articles)} PDFs, split into {len(documents)} chunks")
+        os.makedirs(os.path.dirname(FAISS_INDEX_PATH) or ".", exist_ok=True)
+        
+    with st.spinner('Creating embeddings'):
+            vectorestore = FAISS.from_documents(
+                documents = documents,
+                embedding = embedder
                 )
-                st.success("FAISS index has been successfully loaded")
-                return vectorestore
-        else:
-            if state == 'abstract':
-                papers = st.session_state.papers
-                documents = create_documents(papers)
-                with st.spinner('Creating embeddings'):
-                    vectorestore = FAISS.from_documents(
-                        documents = documents,
-                        embedding = embedder
-                        )
-                    vectorestore.save_local('faiss_index_abstract')
-                    st.success("FAISS index created and saved")
-                    return vectorestore
+            vectorestore.save_local(FAISS_INDEX_PATH)
+            st.success("FAISS index created and saved")
+            return vectorestore 
+                
 
 def get_rag_chain(template, temperature, api_creds, vectorestore = None,  k_max = None):
     """
@@ -458,7 +479,7 @@ if "papers" in st.session_state and st.session_state.papers is not None:
         st.session_state.answer = answer
     
     if "answer" in st.session_state:
-        col1, col2, col3 = st.columns([2,2, 2])
+        col1, col3 = st.columns([2,2])
         
         with col1:
             generate_pdf = st.button("📥 Generate PDF")
@@ -476,46 +497,8 @@ if "papers" in st.session_state and st.session_state.papers is not None:
                 file_name=f"{st.session_state.pdf_title}.pdf",
                 mime="application/pdf"
             )
-                
-        with col2:
-            deep_study_clicked = st.button("🔬 Deep study", key="deep_study_button")
-    
-            if deep_study_clicked:
-                st.session_state.deep_study = not st.session_state.get("deep_study", False)
-        if st.session_state.get("deep_study"):    
-            st.write("#### Documents analysis")
-            st.markdown("""
-            In this secion can study the selected papers from the database in more detail. 
-            Enter titles of interesting papers in the field below   
-            Each paper will be available for:
-            - 📖 Full text analysis
-            - 🔍 Methodology extraction
-            - 📊 Results comparison
-            - 📝 Notes & annotations
-        
-            Pose specific questions about these papers to get AI-powered insights
-            """)
-            papers_input= st.text_area(
-            "**Enter paper titles (one per line or separated by commas):**",
-            placeholder="Example:\n'The Impact of US-China Tariffs on Global Value Chains'\n'Or separate with commas: \
-            Paper A, Paper B, Paper C'",
-            help="Copy and paste paper titles from your search results. You can add multiple papers at once.",
-            height = 100
-            )
-            if papers_input:
-                papers_to_load = re.split(r'[,\n]', papers_input)
-                papers_to_load = [paper.strip() for paper in papers_to_load if paper.strip()]
-                if st.button("Download full articles"):
-                    with st.spinner("Loading the papers ..."):
-                        download_full_articles(
-                            papers_to_load,
-                            st.session_state.papers, 
-                            "/home/jovyan/dlba/dlba_course_miba_25/topic_18/app/data/rag"
-                    )
-                    st.succes('All papers are in the "Articles database" tab')
-                # st.write(papers_to_load)
+
             
-                
         with col3:
             download_conversation = st.button("💾 Download Conversation", key="download_conversation")
     
@@ -534,180 +517,3 @@ if "papers" in st.session_state and st.session_state.papers is not None:
                 mime="application/pdf"
             )
     
-                
-                
-
-# # @st.cache_resource
-# # def initialize_faiss_vectorstore():
-# #     """
-# #     Vectorstore database initialization.
-    
-# #     We use FAISS instead of Chroma in this application.
-    
-# #     """
-# #     API_CREDS = read_json(file_path='apicreds.json')
-# #     APP_CONFIG = read_json(file_path='config.json')
-# #     DATA_PATH = f"{APP_CONFIG['imgs_path']}/rag"
-# #     FAISS_INDEX_PATH = "./faiss_index"
-
-# #     ####################################
-# #     ########## YOUR CODE HERE ##########
-# #     ####################################
-# #     # You have to create embeddings 
-# #     # for vectorstore below
-    
-# #     embedder = YandexGPTEmbeddings(
-# #             api_key = api_creds['api_key'],
-# #             folder_id = api_creds['folder_id'],
-# #             sleep_interval = .1
-# #         )
-
-# #     # HINT: use code from chapter 7.3 
-# #     # of the RAG notebook 
-    
-# #     ####################################
-    
-# #     # If index exists...
-# #     if os.path.exists(FAISS_INDEX_PATH):
-# #         with st.spinner('Loading FAISS index...'):
-# #             vectorstore = FAISS.load_local(
-# #                 FAISS_INDEX_PATH, 
-# #                 embeddings, 
-# #                 allow_dangerous_deserialization=True
-# #             )
-# #             st.success("FAISS index loaded")
-# #             return vectorstore, API_CREDS
-    
-# #     # ...or create new index
-# #     with st.spinner('Documents are loading...'):
-# #         ####################################
-# #         ########## YOUR CODE HERE ##########
-# #         ####################################
-# #         # You have to create loader and docs
-# #         # objects to load documents
-
-# #         loader = # YOUR CODE HERE
-# #         docs = # YOUR CODE HERE
-        
-# #         # HINT: use code from chapter 7.2 
-# #         # of the RAG notebook 
-        
-# #         ####################################
-    
-# #     with st.spinner('Processing documents...'):
-# #         ####################################
-# #         ########## YOUR CODE HERE ##########
-# #         ####################################
-# #         # You have to create text splitter 
-# #         # and get splits
-
-# #         text_splitter = # YOUR CODE HERE
-# #         splits = # YOUR CODE HERE
-        
-# #         # HINT: use code from chapter 7.2 
-# #         # of the RAG notebook 
-        
-# #         ####################################
-    
-# #     with st.spinner('Creating FAISS index...'):
-# #         vectorstore = FAISS.from_documents(splits, embeddings)
-# #         vectorstore.save_local(FAISS_INDEX_PATH)
-# #         st.success("FAISS index created and saved")
-    
-# #     return vectorstore, API_CREDS
-
-
-
-# # We init vectorstore here and put in to app state
-# # for single load when application starts / restarts
-# if 'vectorstore' not in st.session_state:
-#     st.session_state.vectorstore, st.session_state.api_creds = initialize_faiss_vectorstore()
-
-# # Chat prompt
-# # You may experiment with it, 
-# # but keep "Context: {context}\n" and "Question: {question}\n"
-# default_instruction = (
-#     "Use the following pieces of context to answer the question at the end. "
-#     "If you don't know the answer, just say that you don't know, don't try to make up an answer. "
-#     "Use three sentences maximum and keep the answer as concise as possible. "
-#     "Always say \"thanks for asking!\" at the end of the answer. \n"
-#     "Context: {context}\n"
-#     "Question: {question}\n"
-#     "Answer: "
-# )
-
-# st.write('#### Give a prompt')
-# template = st.text_area(
-#     'Input prompt for chat-bot',
-#     default_instruction
-# )
-
-# st.write('#### Temperature for bot')
-# st.write(
-#     """
-#     The higher the value of this parameter, the more creative
-#     and random the model's responses will be. Accepts values
-#     from 0 (inclusive) to 1 (inclusive).
-#     Default value: 0 (no creativity)
-#     """
-# )
-# temperature = st.slider("Input temperature for chat-bot", .0, 1., .0, .1)
-
-# st.write('#### Enter the number of relevant documents')
-# st.write(
-#     """
-#     You need to specify the maximum number of documents in a single
-#     search to limit the search scope for the chat-bot.
-#     Default value: 3 documents
-#     """
-# )
-# k_max = st.slider('Enter the number of documents', 1, 5, 3)
-
-# # Create RAG with parameters (temperature, k_max, ...)
-# ####################################
-# ########## YOUR CODE HERE ##########
-# ####################################
-# # You have to create embeddings 
-# # for vectorstore below
-
-# rag_chain = # YOUR CODE HERE
-
-# # HINT: use function `get_rag_chain(...)`
-# # from above and pass all parameters like
-# #   st.session_state.vectorstore, 
-# #   template, 
-# #   temperature, 
-# #   k_max, 
-# #   st.session_state.api_creds
-# # to that function
-
-# ####################################
-
-# # Start chat
-# st.write('#### Ask chat-bot your questions')
-
-# if 'messages' not in st.session_state:
-#     st.session_state.messages = []
-
-# for message in st.session_state.messages:
-#     with st.chat_message(message['role']):
-#         st.markdown(message['content'])
-
-# if query := st.chat_input('Enter your message'):
-#     st.chat_message('user').markdown(query)
-#     st.session_state.messages.append(
-#         {
-#             'role': 'user',
-#             'content': query
-#         }
-#     )
-    
-#     answer = rag_chain.invoke(query)
-#     with st.chat_message('assistant'):
-#         st.markdown(answer)
-#     st.session_state.messages.append(
-#         {
-#             'role': 'assistant',
-#             'content': answer
-#         }
-#     )
